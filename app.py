@@ -13,6 +13,23 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# ── Download transactions.csv from Google Drive if not present ─────────────────
+GDRIVE_FILE_ID = "1HqLSBnCbNqbVGDBlX1BuQs1vMVLG8Buh"
+
+def download_csv_if_needed():
+    if not os.path.exists("transactions.csv"):
+        try:
+            import urllib.request
+            url = f"https://drive.google.com/uc?export=download&id={GDRIVE_FILE_ID}&confirm=t"
+            st.info("📥 Downloading DLD transaction data... this may take a minute on first load.")
+            urllib.request.urlretrieve(url, "transactions.csv")
+            st.success("✅ DLD data downloaded successfully!")
+            st.rerun()
+        except Exception as e:
+            st.warning(f"Could not download DLD data: {e}. Using fallback prices.")
+
+download_csv_if_needed()
+
 # ── AED formatting helpers ─────────────────────────────────────────────────────
 def format_aed(value):
     digits = re.sub(r"[^\d]", "", str(value))
@@ -380,16 +397,16 @@ col_left, col_right = st.columns(2, gap="large")
 
 with col_left:
     st.markdown('<div class="card-title">Property Details</div>', unsafe_allow_html=True)
-    community = st.selectbox("Community", sorted(COMMUNITIES.keys()))
+    community = st.selectbox("Community", get_communities())
     beds      = st.selectbox("Bedrooms", list(BED_KEY.keys()))
-    mkt       = COMMUNITIES[community]
-    mkt_psf   = mkt["psf"]
+    mkt_psf   = get_psf(community)
     beds_key  = BED_KEY[beds]
+    txn_count = community_stats.get(community, {}).get("count", 0)
 
     with st.spinner("Fetching live rent from Bayut..."):
         live_rent, is_live = fetch_live_rent(community, beds_key)
 
-    fallback_rent = mkt[beds_key]
+    fallback_rent = get_rent_fallback(community, beds_key)
     default_rent  = live_rent if is_live and live_rent else fallback_rent
     rent_source   = "live" if is_live and live_rent else "static"
 
@@ -405,10 +422,11 @@ with col_left:
 
     st.text_input("Purchase Price (AED)", key="price_input", on_change=update_price)
     price = max(300000, min(50000000, parse_aed(st.session_state.price_input) or int(suggested_price)))
+    txn_note = f" · Based on {txn_count:,} DLD transactions" if txn_count else " · Fallback estimate"
     st.markdown(
-        f'<div class="hint">Market avg: AED {mkt_psf:,}/sqft · '
+        f'<div class="hint">DLD avg: AED {mkt_psf:,}/sqft · '
         f'Suggested: AED {suggested_price:,} · '
-        f'Your price: AED {round(price/size_sqft):,}/sqft</div>',
+        f'Your price: AED {round(price/size_sqft):,}/sqft{txn_note}</div>',
         unsafe_allow_html=True
     )
 
@@ -430,7 +448,542 @@ with col_left:
         )
     else:
         st.markdown(
-            f'<div class="hint"><span class="static-badge">Market avg</span> '
+            f'<div class="hint"><span class="static-badge">Indicative avg</span> '
+            f'{beds} in {community.split("(")[0].strip()}: '
+            f'AED {fallback_rent:,}/yr · AED {round(fallback_rent/12):,}/mo · '
+            f'Adjust above if needed</div>',
+            unsafe_allow_html=True
+        )
+
+with col_right:
+    st.markdown('<div class="card-title">Financial Assumptions</div>', unsafe_allow_html=True)
+
+    dp_pct = st.number_input("Down Payment (%)", min_value=15, max_value=80, value=25, step=5)
+    st.markdown('<div class="hint">UAE minimum: 20% expats · 15% UAE nationals · Off-plan varies</div>', unsafe_allow_html=True)
+
+    rate_pct = st.number_input("Mortgage Interest Rate (%)", min_value=1.0, max_value=12.0, value=4.5, step=0.1)
+    st.markdown('<div class="hint">Current UAE fixed: 3.99%–5.5% · Variable: 4.0%–6.0%</div>', unsafe_allow_html=True)
+
+    term_yrs = st.number_input("Mortgage Term (Years)", min_value=5, max_value=25, value=25, step=1)
+    st.markdown('<div class="hint">Max term in UAE: 25 years · Must complete before age 70</div>', unsafe_allow_html=True)
+
+    appr_pct = st.number_input("Annual Price Appreciation (%)", min_value=0.0, max_value=20.0, value=5.0, step=0.5)
+    st.markdown('<div class="hint">Dubai 5-yr avg: 4–7% · Conservative: 3% · Optimistic: 8–10%</div>', unsafe_allow_html=True)
+
+    ri_pct = st.number_input("Annual Rent Increase (%)", min_value=0.0, max_value=20.0, value=5.0, step=0.5)
+    st.markdown('<div class="hint">Dubai RERA cap: 0–20% depending on gap vs market · Avg: 5–10%</div>', unsafe_allow_html=True)
+
+    sc_psf = st.number_input("Service Charge (AED per sqft per year)", min_value=8, max_value=30, value=15, step=1)
+    st.markdown('<div class="hint">Affordable (JVC, Motor City): AED 8–12 · Mid-market (Business Bay, JLT): AED 12–18 · Premium (Marina, Downtown): AED 18–25 · Luxury (Palm, DIFC): AED 25–30</div>', unsafe_allow_html=True)
+
+st.markdown("""
+<div class="disclaimer">
+  <b>Data sources:</b> Purchase price benchmarks from DLD historical transaction data.
+  Rental prices pulled live from Bayut API where available, otherwise Q1 2026 market averages
+  verified against Bayut Dubai Rental Report 2025 and DLD Rental Index.
+  All figures are indicative — actual prices vary by building, floor, and furnishing.
+  Adjust any value manually. This tool does not constitute financial or investment advice.
+</div>
+""", unsafe_allow_html=True)
+
+# ── Calculate ──────────────────────────────────────────────────────────────────
+r = calculate(price, annual_rent, dp_pct, rate_pct, term_yrs, appr_pct, ri_pct, sc_psf, size_sqft)
+st.markdown("---")
+
+# ── Yield sanity check ─────────────────────────────────────────────────────────
+gross_yield = (annual_rent / price) * 100
+if gross_yield < 3:
+    st.warning(
+        f"⚠️ **Low yield alert:** At AED {annual_rent:,}/yr rent on a AED {price:,} property, "
+        f"the gross yield is only {gross_yield:.1f}%. Dubai market average is 5–7%. "
+        f"Consider adjusting the rent or purchase price — this may skew the break-even result."
+    )
+
+# ── Verdict ────────────────────────────────────────────────────────────────────
+if r["be_year"]:
+    verdict_str   = f"Buying beats renting in {r['be_year']} year{'s' if r['be_year'] > 1 else ''}"
+    verdict_sub   = f"After year {r['be_year']}, owning in {community.split('(')[0].strip()} costs less than renting — and you build equity."
+    verdict_class = "verdict-buy"
+    verdict_color = "#2d9e5f"
+else:
+    verdict_str   = "Renting is more cost-effective over 10 years"
+    verdict_sub   = "At current prices and rates, renting is financially better over a 10-year horizon — but you build no equity."
+    verdict_class = "verdict-rent"
+    verdict_color = "#9e2d2d"
+
+st.markdown(f"""
+<div class="{verdict_class}">
+  <div class="verdict-title" style="color:{verdict_color};">{verdict_str}</div>
+  <div class="verdict-sub">{verdict_sub}</div>
+</div>
+""", unsafe_allow_html=True)
+
+# ── KPIs ───────────────────────────────────────────────────────────────────────
+gv = "Yes ✓" if price >= 2_000_000 else "No ✗"
+st.markdown(f"""
+<div class="kpi-grid">
+  <div class="kpi-card"><div class="kpi-val">{fmt(r['mortgage'])}/mo</div><div class="kpi-lbl">Monthly mortgage</div></div>
+  <div class="kpi-card"><div class="kpi-val">{fmt(r['upfront'])}</div><div class="kpi-lbl">Upfront cost (incl. DLD fees)</div></div>
+  <div class="kpi-card"><div class="kpi-val">{gross_yield:.1f}%</div><div class="kpi-lbl">Gross rental yield</div></div>
+  <div class="kpi-card"><div class="kpi-val">{fmt(r['equity'])}</div><div class="kpi-lbl">Est. equity after 10 yrs</div></div>
+  <div class="kpi-card"><div class="kpi-val">{fmt(r['prop_val'])}</div><div class="kpi-lbl">Est. property value 10 yrs</div></div>
+  <div class="kpi-card"><div class="kpi-val">{gv}</div><div class="kpi-lbl">Golden Visa eligible</div></div>
+</div>
+""", unsafe_allow_html=True)
+
+# ── Cost bars ──────────────────────────────────────────────────────────────────
+mx       = max(r["ownership_cost"], r["rent_cumulative"])
+buy_pct  = int(r["ownership_cost"]  / mx * 100)
+rent_pct = int(r["rent_cumulative"] / mx * 100)
+
+st.markdown(f"""
+<div class="bar-section">
+  <div class="bar-title">10-Year Cost of Ownership vs Renting</div>
+  <div class="bar-note" style="margin-bottom:14px; color:#8a9bb5;">
+    Buying bar = extra costs only (what you pay beyond the property price itself).
+    Property price and down payment are NOT included — you own the asset at the end.
+  </div>
+
+  <div class="bar-row">
+    <div class="bar-label">🟢 Cost of buying</div>
+    <div class="bar-track"><div class="bar-fill-buy" style="width:{buy_pct}%"></div></div>
+    <div class="bar-val">{fmt(r["ownership_cost"])}</div>
+  </div>
+  <div class="bar-note" style="margin-bottom:14px; margin-left:172px;">
+    DLD fee {fmt(r["dld_fee"])}
+    + Agent {fmt(r["agent_fee"])}
+    + Reg AED 4,200
+    + 10-yr mortgage interest {fmt(r["total_interest"])}
+    + 10-yr service charge {fmt(r["total_service"])}
+  </div>
+
+  <div class="bar-row">
+    <div class="bar-label">🔴 Cost of renting</div>
+    <div class="bar-track"><div class="bar-fill-rent" style="width:{rent_pct}%"></div></div>
+    <div class="bar-val">{fmt(r["rent_cumulative"])}</div>
+  </div>
+  <div class="bar-note" style="margin-left:172px;">
+    10 years of rent · starts AED {annual_rent:,}/yr · increases {ri_pct}% annually · nothing owned at the end
+  </div>
+
+  <div class="bar-note" style="margin-top:14px; padding-top:12px; border-top:1px solid rgba(201,168,76,0.15); color:#C9A84C;">
+    After 10 years: buyer owns a property worth {fmt(r["prop_val"])} with {fmt(r["equity"])} in equity.
+    Renter owns nothing.
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+# ── Full breakdown ─────────────────────────────────────────────────────────────
+with st.expander("📊 Full cost breakdown & 10-year projection"):
+    bc1, bc2 = st.columns(2)
+    with bc1:
+        st.markdown("**Upfront buying costs**")
+        st.write(f"Down payment ({dp_pct}%): AED {round(price * dp_pct/100):,}")
+        st.write(f"DLD transfer fee (4%): AED {r['dld_fee']:,}")
+        st.write(f"Agent commission (2%): AED {r['agent_fee']:,}")
+        st.write(f"Registration fee: AED 4,200")
+        st.write(f"**Total upfront: AED {r['upfront']:,}**")
+        st.markdown("---")
+        st.write(f"Monthly mortgage: AED {r['mortgage']:,}")
+        st.write(f"Annual service charge: AED {r['service_charge']:,}")
+        st.write(f"Gross rental yield: {gross_yield:.1f}%")
+    with bc2:
+        st.markdown("**Year-by-year projection**")
+        st.dataframe(
+            pd.DataFrame(r["yearly"]).set_index("Year"),
+            use_container_width=True
+        )
+
+st.markdown("---")
+
+# ── Lead capture ───────────────────────────────────────────────────────────────
+st.markdown("""
+<div class="lead-box">
+  <div class="lead-title">Get Your Free Personalised Property Report</div>
+  <div class="lead-sub">
+    Based on your inputs, I'll send you a detailed analysis with DLD comparables,
+    area market data, and my personal recommendation as a Dubai real estate expert.
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+st.markdown("<br>", unsafe_allow_html=True)
+
+with st.form("lead_form", clear_on_submit=True):
+    lc1, lc2, lc3 = st.columns(3)
+    with lc1:
+        lead_name  = st.text_input("Your Name *",         placeholder="Ahmed Al Mansouri")
+    with lc2:
+        lead_email = st.text_input("Email Address *",     placeholder="ahmed@email.com")
+    with lc3:
+        lead_phone = st.text_input("WhatsApp / Phone *",  placeholder="+971 50 123 4567")
+
+    submitted = st.form_submit_button("Get My Free Property Report")
+    if submitted:
+        if not lead_name or not lead_email or not lead_phone:
+            st.error("Please fill in all three fields.")
+        else:
+            ts      = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            be_text = f"Year {r['be_year']}" if r["be_year"] else "No break-even in 10 yrs"
+            lead    = {
+                "name": lead_name, "email": lead_email, "phone": lead_phone,
+                "community": community, "beds": beds, "size_sqft": size_sqft,
+                "price": price, "annual_rent": annual_rent, "verdict": verdict_str,
+                "breakeven": be_text, "mortgage": r["mortgage"], "timestamp": ts,
+            }
+            save_lead([ts, lead_name, lead_email, lead_phone, community, beds,
+                       size_sqft, price, annual_rent, verdict_str, be_text, r["mortgage"]])
+            send_email(lead)
+            st.success(
+                f"Thank you {lead_name.split()[0]}! Your request is received. "
+                f"Rahul will contact you within 24 hours on {lead_phone}."
+            )
+
+st.markdown("---")
+st.markdown(
+    "<p style='text-align:center;color:#2a3548;font-size:0.75rem;'>"
+    "Built by Rahul Verma · Dubai Real Estate Agent & Python Developer · "
+    "Data: DLD transactions + Bayut API + DLD Rental Index 2026</p>",
+    unsafe_allow_html=True
+)# ── Community data — loaded from DLD transactions.csv ─────────────────────────
+BED_KEY = {"Studio": "studio", "1 BR": "1br", "2 BR": "2br", "3 BR": "3br", "4+ BR": "4br"}
+
+# Fallback rent data (used when Bayut API unavailable)
+RENT_FALLBACK = {
+    "Palm Jumeirah":              {"studio": 110000, "1br": 160000, "2br": 230000, "3br": 330000, "4br": 460000},
+    "Downtown Dubai":             {"studio": 82000,  "1br": 115000, "2br": 168000, "3br": 245000, "4br": 330000},
+    "Dubai Marina":               {"studio": 68000,  "1br": 98000,  "2br": 140000, "3br": 192000, "4br": 258000},
+    "Business Bay":               {"studio": 62000,  "1br": 88000,  "2br": 125000, "3br": 175000, "4br": 230000},
+    "JVC (Jumeirah Village Circle)": {"studio": 45000, "1br": 65000, "2br": 88000, "3br": 118000, "4br": 155000},
+    "DIFC":                       {"studio": 88000,  "1br": 125000, "2br": 180000, "3br": 258000, "4br": 345000},
+    "JBR (Jumeirah Beach)":       {"studio": 75000,  "1br": 108000, "2br": 155000, "3br": 210000, "4br": 280000},
+    "Dubai Hills Estate":         {"studio": 58000,  "1br": 88000,  "2br": 132000, "3br": 180000, "4br": 240000},
+    "Arabian Ranches":            {"studio": 52000,  "1br": 82000,  "2br": 122000, "3br": 165000, "4br": 210000},
+    "Jumeirah Lake Towers":       {"studio": 48000,  "1br": 70000,  "2br": 98000,  "3br": 132000, "4br": 172000},
+}
+DEFAULT_RENT_FALLBACK = {"studio": 45000, "1br": 70000, "2br": 100000, "3br": 140000, "4br": 185000}
+
+@st.cache_data
+def load_community_stats():
+    """
+    Load avg price/sqft per area directly from DLD transactions.csv.
+    Returns dict: {area_name: {"psf": avg_psf, "total_transactions": count}}
+    Falls back to empty dict if CSV not found.
+    """
+    if not os.path.exists("transactions.csv"):
+        return {}
+    try:
+        df = pd.read_csv("transactions.csv", low_memory=False)
+        df = df.rename(columns={
+            "area_name_en":  "area",
+            "procedure_area":"size_sqft",
+            "actual_worth":  "price_aed",
+            "instance_date": "date",
+            "trans_group_en":"trans_type",
+        })
+        df["date"]     = pd.to_datetime(df["date"], errors="coerce")
+        df["year"]     = df["date"].dt.year
+        df["size_sqft"]= pd.to_numeric(df["size_sqft"], errors="coerce")
+        df["price_aed"]= pd.to_numeric(df["price_aed"], errors="coerce")
+        df = df[df["trans_type"].str.contains("Sale", case=False, na=False)]
+        df = df.dropna(subset=["price_aed","size_sqft","area"])
+        df = df[(df["price_aed"] > 50000) & (df["size_sqft"] > 50)]
+        df["psf"] = df["price_aed"] / df["size_sqft"]
+        # Use last 2 years for most current prices
+        max_year = df["year"].max()
+        recent   = df[df["year"] >= max_year - 1]
+        if len(recent) < 1000:
+            recent = df
+        stats = (
+            recent.groupby("area")
+            .agg(avg_psf=("psf","median"), count=("psf","count"))
+            .reset_index()
+        )
+        stats = stats[stats["count"] >= 10]  # min 10 transactions for reliability
+        result = {}
+        for _, row in stats.iterrows():
+            result[row["area"]] = {
+                "psf":   round(row["avg_psf"], 0),
+                "count": int(row["count"])
+            }
+        return result
+    except Exception as e:
+        return {}
+
+community_stats = load_community_stats()
+
+def get_communities():
+    """Return sorted list of all communities from DLD data."""
+    if community_stats:
+        return sorted(community_stats.keys())
+    # Fallback list if no CSV
+    return sorted(RENT_FALLBACK.keys())
+
+def get_psf(area):
+    """Get avg price/sqft for an area from DLD data."""
+    if area in community_stats:
+        return int(community_stats[area]["psf"])
+    return 1500  # generic fallback
+
+def get_rent_fallback(area, beds_key):
+    """Get fallback rent for area+beds."""
+    if area in RENT_FALLBACK:
+        return RENT_FALLBACK[area].get(beds_key, DEFAULT_RENT_FALLBACK[beds_key])
+    return DEFAULT_RENT_FALLBACK[beds_key]
+
+
+# ── Bayut live rent fetch ──────────────────────────────────────────────────────
+def get_bayut_headers():
+    return {"x-rapidapi-key": RAPIDAPI_KEY, "x-rapidapi-host": RAPIDAPI_HOST}
+
+@st.cache_data(ttl=3600)
+def fetch_live_rent(community, beds_key):
+    if not RAPIDAPI_KEY:
+        return None, False
+    try:
+        r1   = requests.get(f"https://{RAPIDAPI_HOST}/autocomplete",
+                            headers=get_bayut_headers(),
+                            params={"query": community.split("(")[0].strip()}, timeout=8)
+        locs = r1.json().get("data", {}).get("locations", [])
+        if not locs:
+            return None, False
+        loc_id   = locs[0]["externalID"]
+        beds_num = {"studio":"0","1br":"1","2br":"2","3br":"3","4br":"4"}
+        params   = {"purpose":"for-rent","locationExternalIDs":loc_id,"hitsPerPage":"50","page":"1"}
+        if beds_key in beds_num:
+            params["beds"] = beds_num[beds_key]
+        r2   = requests.get(f"https://{RAPIDAPI_HOST}/transactions",
+                            headers=get_bayut_headers(), params=params, timeout=8)
+        hits = r2.json().get("data", {}).get("hits", [])
+        if not hits:
+            return None, False
+        rents = []
+        for h in hits:
+            amt = h.get("contract_monthly_amount") or h.get("transaction_amount")
+            if amt:
+                try:
+                    v = float(amt)
+                    annual = v * 12 if v < 100000 else v
+                    if 20000 < annual < 2000000:
+                        rents.append(annual)
+                except Exception:
+                    pass
+        if len(rents) < 3:
+            return None, False
+        return int(sum(rents) / len(rents)), True
+    except Exception:
+        return None, False
+
+# ── Google Sheets ──────────────────────────────────────────────────────────────
+def get_sheet():
+    try:
+        scopes = ["https://spreadsheets.google.com/feeds","https://www.googleapis.com/auth/drive"]
+        creds  = Credentials.from_service_account_file(GOOGLE_CREDS_JSON, scopes=scopes)
+        client = gspread.authorize(creds)
+        sheet  = client.open(GOOGLE_SHEET_NAME).sheet1
+        if sheet.row_count == 0 or sheet.cell(1,1).value != "Timestamp":
+            sheet.append_row(["Timestamp","Name","Email","Phone","Community","Beds",
+                               "Size (sqft)","Purchase Price","Annual Rent",
+                               "Verdict","Break-even Year","Monthly Mortgage"])
+        return sheet
+    except Exception:
+        return None
+
+def save_lead(row):
+    try:
+        sheet = get_sheet()
+        if sheet:
+            sheet.append_row(row)
+            return True
+    except Exception:
+        pass
+    return False
+
+def send_email(lead):
+    if not all([GMAIL_SENDER, GMAIL_APP_PASSWORD, GMAIL_NOTIFY]):
+        return False
+    try:
+        msg            = MIMEMultipart("alternative")
+        msg["Subject"] = f"New Lead: {lead['name']} — {lead['community']} {lead['beds']}"
+        msg["From"]    = GMAIL_SENDER
+        msg["To"]      = GMAIL_NOTIFY
+        html = f"""
+        <div style="font-family:Arial,sans-serif;max-width:580px;margin:0 auto;">
+          <div style="background:#C9A84C;padding:20px 30px;border-radius:10px 10px 0 0;">
+            <h2 style="color:#0a0f1e;margin:0;">New Property Lead 🏙️</h2>
+            <p style="color:#0a0f1e;margin:4px 0 0;opacity:0.75;font-size:13px;">Dubai Rent vs Buy Calculator · {lead['timestamp']}</p>
+          </div>
+          <div style="background:#111827;padding:25px 30px;border-radius:0 0 10px 10px;">
+            <table style="width:100%;border-collapse:collapse;font-size:14px;color:#e8e0d0;">
+              <tr><td style="padding:7px 0;color:#8a9bb5;width:45%;">Name</td><td style="color:#C9A84C;font-weight:bold;">{lead['name']}</td></tr>
+              <tr><td style="padding:7px 0;color:#8a9bb5;">Email</td><td>{lead['email']}</td></tr>
+              <tr><td style="padding:7px 0;color:#8a9bb5;">WhatsApp</td><td>{lead['phone']}</td></tr>
+              <tr><td style="padding:7px 0;color:#8a9bb5;">Community</td><td>{lead['community']}</td></tr>
+              <tr><td style="padding:7px 0;color:#8a9bb5;">Bedrooms</td><td>{lead['beds']}</td></tr>
+              <tr><td style="padding:7px 0;color:#8a9bb5;">Size</td><td>{lead['size_sqft']:,} sqft</td></tr>
+              <tr><td style="padding:7px 0;color:#8a9bb5;">Purchase Price</td><td>AED {lead['price']:,}</td></tr>
+              <tr><td style="padding:7px 0;color:#8a9bb5;">Annual Rent</td><td>AED {lead['annual_rent']:,}</td></tr>
+              <tr><td style="padding:7px 0;color:#8a9bb5;">Verdict</td><td style="color:{'#2d9e5f' if 'beats' in lead['verdict'] else '#9e2d2d'};font-weight:bold;">{lead['verdict']}</td></tr>
+              <tr><td style="padding:7px 0;color:#8a9bb5;">Break-even</td><td>{lead['breakeven']}</td></tr>
+              <tr><td style="padding:7px 0;color:#8a9bb5;">Monthly Mortgage</td><td>AED {lead['mortgage']:,}</td></tr>
+            </table>
+          </div>
+        </div>"""
+        msg.attach(MIMEText(html, "html"))
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
+            s.login(GMAIL_SENDER, GMAIL_APP_PASSWORD)
+            s.sendmail(GMAIL_SENDER, GMAIL_NOTIFY, msg.as_string())
+        return True
+    except Exception:
+        return False
+
+# ── Calculation engine (fixed) ─────────────────────────────────────────────────
+def calculate(price, annual_rent, dp_pct, rate_pct, term_yrs, appr_pct, ri_pct, sc_psf, size_sqft, years=10):
+    loan         = price * (1 - dp_pct / 100)
+    monthly_rate = (rate_pct / 100) / 12
+    n_months     = term_yrs * 12
+    mortgage     = loan * (monthly_rate * (1 + monthly_rate)**n_months) / ((1 + monthly_rate)**n_months - 1) if monthly_rate > 0 else loan / n_months
+
+    dld_fee   = price * 0.04
+    agent_fee = price * 0.02
+    upfront   = price * (dp_pct / 100) + dld_fee + agent_fee + 4200
+
+    # Buy total starts at upfront (cash already spent on day 1)
+    buy_cumulative  = upfront
+    rent_cumulative = 0
+    cur_rent        = annual_rent
+    balance         = loan
+    prop_val        = price
+    be_year         = None
+    yearly          = []
+
+    for y in range(1, years + 1):
+        ann_mortgage   = mortgage * 12
+        service_charge = sc_psf * size_sqft      # annual service charge (AED/sqft × sqft)
+        buy_cumulative  += ann_mortgage + service_charge
+        rent_cumulative += cur_rent
+
+        # Pay down loan
+        interest  = balance * (rate_pct / 100)
+        principal = ann_mortgage - interest
+        balance   = max(0, balance - principal)
+        prop_val *= (1 + appr_pct / 100)
+        cur_rent *= (1 + ri_pct / 100)
+
+        # Net buy cost = total spent MINUS appreciation gained
+        net_buy_cost = buy_cumulative - (prop_val - price)
+        if be_year is None and net_buy_cost < rent_cumulative:
+            be_year = y
+
+        yearly.append({
+            "Year":                    y,
+            "Cumulative Buy Cost":     f"AED {round(buy_cumulative):,}",
+            "Cumulative Rent Cost":    f"AED {round(rent_cumulative):,}",
+            "Net Buy Cost (adj.)":     f"AED {round(net_buy_cost):,}",
+            "Property Value":          f"AED {round(prop_val):,}",
+            "Remaining Loan":          f"AED {round(balance):,}",
+        })
+
+    equity = prop_val - balance - upfront
+
+    # Option B: extra costs only (no property price, no down payment)
+    # = DLD fee + agent + registration + total mortgage interest paid + total service charges
+    total_interest     = (mortgage * 12 * 10) - (loan - balance)   # interest portion only
+    total_service      = round(sc_psf * size_sqft * 10)
+    ownership_cost     = round(dld_fee + agent_fee + 4200 + total_interest + total_service)
+
+    return {
+        "mortgage":          round(mortgage),
+        "upfront":           round(upfront),
+        "buy_cumulative":    round(buy_cumulative),
+        "ownership_cost":    ownership_cost,
+        "rent_cumulative":   round(rent_cumulative),
+        "equity":            round(equity),
+        "prop_val":          round(prop_val),
+        "dld_fee":           round(dld_fee),
+        "agent_fee":         round(agent_fee),
+        "loan":              round(loan),
+        "be_year":           be_year,
+        "yearly":            yearly,
+        "service_charge":    round(sc_psf * size_sqft),
+        "total_interest":    round(total_interest),
+        "total_service":     total_service,
+    }
+
+def fmt(n):
+    n = round(n)
+    if abs(n) >= 1_000_000: return f"AED {n/1_000_000:.2f}M"
+    if abs(n) >= 1_000:     return f"AED {n:,.0f}"
+    return f"AED {n}"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# UI
+# ══════════════════════════════════════════════════════════════════════════════
+st.markdown("""
+<div class="hero">
+  <div class="hero-title">Dubai Rent vs Buy Calculator</div>
+  <div class="hero-sub">Make smarter property decisions with real Dubai market data</div>
+  <div class="hero-badge">2026 Edition · 50+ Communities · Live Bayut Pricing</div>
+</div>
+""", unsafe_allow_html=True)
+st.markdown("---")
+
+col_left, col_right = st.columns(2, gap="large")
+
+with col_left:
+    st.markdown('<div class="card-title">Property Details</div>', unsafe_allow_html=True)
+    community = st.selectbox("Community", get_communities())
+    beds      = st.selectbox("Bedrooms", list(BED_KEY.keys()))
+    mkt_psf   = get_psf(community)
+    beds_key  = BED_KEY[beds]
+    txn_count = community_stats.get(community, {}).get("count", 0)
+
+    with st.spinner("Fetching live rent from Bayut..."):
+        live_rent, is_live = fetch_live_rent(community, beds_key)
+
+    fallback_rent = get_rent_fallback(community, beds_key)
+    default_rent  = live_rent if is_live and live_rent else fallback_rent
+    rent_source   = "live" if is_live and live_rent else "static"
+
+    size_sqft = st.number_input("Property Size (sqft)", min_value=200, max_value=20000, value=1000, step=50)
+    suggested_price = mkt_psf * size_sqft
+
+    # ── Price input with auto comma formatting ─────────────────────────────
+    if "price_input" not in st.session_state or        abs(parse_aed(st.session_state.get("price_input","0")) - int(suggested_price)) > 500000:
+        st.session_state.price_input = f"{int(suggested_price):,}"
+
+    def update_price():
+        st.session_state.price_input = format_aed(st.session_state.price_input)
+
+    st.text_input("Purchase Price (AED)", key="price_input", on_change=update_price)
+    price = max(300000, min(50000000, parse_aed(st.session_state.price_input) or int(suggested_price)))
+    txn_note = f" · Based on {txn_count:,} DLD transactions" if txn_count else " · Fallback estimate"
+    st.markdown(
+        f'<div class="hint">DLD avg: AED {mkt_psf:,}/sqft · '
+        f'Suggested: AED {suggested_price:,} · '
+        f'Your price: AED {round(price/size_sqft):,}/sqft{txn_note}</div>',
+        unsafe_allow_html=True
+    )
+
+    # ── Rent input with auto comma formatting ──────────────────────────────
+    if "rent_input" not in st.session_state:
+        st.session_state.rent_input = f"{int(default_rent):,}"
+
+    def update_rent():
+        st.session_state.rent_input = format_aed(st.session_state.rent_input)
+
+    st.text_input("Annual Rent (AED)", key="rent_input", on_change=update_rent)
+    annual_rent = max(20000, min(2000000, parse_aed(st.session_state.rent_input) or default_rent))
+    if rent_source == "live":
+        st.markdown(
+            f'<div class="hint"><span class="live-badge">Live Bayut</span> '
+            f'Avg {beds} rent in {community.split("(")[0].strip()}: '
+            f'AED {live_rent:,}/yr · AED {round(live_rent/12):,}/mo</div>',
+            unsafe_allow_html=True
+        )
+    else:
+        st.markdown(
+            f'<div class="hint"><span class="static-badge">Indicative avg</span> '
             f'{beds} in {community.split("(")[0].strip()}: '
             f'AED {fallback_rent:,}/yr · AED {round(fallback_rent/12):,}/mo · '
             f'Adjust above if needed</div>',
