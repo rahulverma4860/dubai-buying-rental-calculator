@@ -7,10 +7,20 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import requests
 import os
+import re
 from datetime import datetime
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# ── AED formatting helpers ─────────────────────────────────────────────────────
+def format_aed(value):
+    digits = re.sub(r"[^\d]", "", str(value))
+    return f"{int(digits):,}" if digits else ""
+
+def parse_aed(value):
+    digits = re.sub(r"[^\d]", "", str(value))
+    return int(digits) if digits else 0
 
 GOOGLE_CREDS_JSON  = os.getenv("GOOGLE_CREDS_JSON", "google_creds.json")
 GOOGLE_SHEET_NAME  = os.getenv("GOOGLE_SHEET_NAME", "Dubai Calculator Leads")
@@ -386,9 +396,15 @@ with col_left:
     size_sqft = st.number_input("Property Size (sqft)", min_value=200, max_value=20000, value=1000, step=50)
     suggested_price = mkt_psf * size_sqft
 
-    price = st.number_input("Purchase Price (AED)",
-                             min_value=300000, max_value=50000000,
-                             value=int(suggested_price), step=50000)
+    # ── Price input with auto comma formatting ─────────────────────────────
+    if "price_input" not in st.session_state or        abs(parse_aed(st.session_state.get("price_input","0")) - int(suggested_price)) > 500000:
+        st.session_state.price_input = f"{int(suggested_price):,}"
+
+    def update_price():
+        st.session_state.price_input = format_aed(st.session_state.price_input)
+
+    st.text_input("Purchase Price (AED)", key="price_input", on_change=update_price)
+    price = max(300000, min(50000000, parse_aed(st.session_state.price_input) or int(suggested_price)))
     st.markdown(
         f'<div class="hint">Market avg: AED {mkt_psf:,}/sqft · '
         f'Suggested: AED {suggested_price:,} · '
@@ -396,9 +412,15 @@ with col_left:
         unsafe_allow_html=True
     )
 
-    annual_rent = st.number_input("Annual Rent (AED)",
-                                   min_value=20000, max_value=2000000,
-                                   value=default_rent, step=5000)
+    # ── Rent input with auto comma formatting ──────────────────────────────
+    if "rent_input" not in st.session_state:
+        st.session_state.rent_input = f"{int(default_rent):,}"
+
+    def update_rent():
+        st.session_state.rent_input = format_aed(st.session_state.rent_input)
+
+    st.text_input("Annual Rent (AED)", key="rent_input", on_change=update_rent)
+    annual_rent = max(20000, min(2000000, parse_aed(st.session_state.rent_input) or default_rent))
     if rent_source == "live":
         st.markdown(
             f'<div class="hint"><span class="live-badge">Live Bayut</span> '
@@ -419,7 +441,7 @@ with col_right:
     st.markdown('<div class="card-title">Financial Assumptions</div>', unsafe_allow_html=True)
 
     dp_pct = st.number_input("Down Payment (%)", min_value=15, max_value=80, value=25, step=5)
-    st.markdown('<div class="hint">UAE minimum: 20% expats · 40% international buyers · 15% UAE nationals · Off-plan varies</div>', unsafe_allow_html=True)
+    st.markdown('<div class="hint">UAE minimum: 20% expats · 15% UAE nationals · Off-plan varies</div>', unsafe_allow_html=True)
 
     rate_pct = st.number_input("Mortgage Interest Rate (%)", min_value=1.0, max_value=12.0, value=4.5, step=0.1)
     st.markdown('<div class="hint">Current UAE fixed: 3.99%–5.5% · Variable: 4.0%–6.0%</div>', unsafe_allow_html=True)
@@ -534,7 +556,7 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # ── Full breakdown ─────────────────────────────────────────────────────────────
-with st.expander("📊 Full cost breakdown & 10-year projection", expanded=True):
+with st.expander("📊 Full cost breakdown & 10-year projection"):
     bc1, bc2 = st.columns(2)
     with bc1:
         st.markdown("**Upfront buying costs**")
