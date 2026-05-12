@@ -484,7 +484,7 @@ with col_right:
     st.markdown('<div class="card-title">Financial Assumptions</div>', unsafe_allow_html=True)
 
     dp_pct = st.number_input("Down Payment (%)", min_value=15, max_value=80, value=25, step=5)
-    st.markdown('<div class="hint">UAE minimum: 20% expats · 15% UAE nationals · Off-plan varies</div>', unsafe_allow_html=True)
+    st.markdown('<div class="hint">UAE minimum: 20% expats · 40% International Buyers · 15% UAE nationals · Off-plan varies</div>', unsafe_allow_html=True)
 
     rate_pct = st.number_input("Mortgage Interest Rate (%)", min_value=1.0, max_value=12.0, value=4.5, step=0.1)
     st.markdown('<div class="hint">Current UAE fixed: 3.99%–5.5% · Variable: 4.0%–6.0%</div>', unsafe_allow_html=True)
